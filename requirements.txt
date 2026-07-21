@@ -2,6 +2,7 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 psycopg2-binary==2.9.10
 passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
 PyJWT==2.9.0
 pydantic[email]==2.9.2
 python-dotenv==1.0.1
