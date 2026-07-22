@@ -255,7 +255,7 @@ EMAIL_SAFETY = """<tr><td style="padding:8px 0 0;">
       <tr><td style="padding:0 0 10px;vertical-align:top;width:18px;"><span style="font-family:Helvetica,Arial,sans-serif;color:rgba(232,232,232,0.3);font-size:13px;">—</span></td>
           <td style="padding:0 0 10px;"><p style="font-family:Helvetica,Arial,sans-serif;color:rgba(232,232,232,0.45);font-size:12.5px;line-height:1.6;margin:0;">Always check that links point to a domain you recognize before entering your credentials.</p></td></tr>
       <tr><td style="padding:0;vertical-align:top;width:18px;"><span style="font-family:Helvetica,Arial,sans-serif;color:rgba(232,232,232,0.3);font-size:13px;">—</span></td>
-          <td style="padding:0;"><p style="font-family:Helvetica,Arial,sans-serif;color:rgba(232,232,232,0.45);font-size:12.5px;line-height:1.6;margin:0;">Didn't request this? Ignore this email — no changes will be made to your account.</p></td></tr>
+          <td style="padding:0;"><p style="font-family:Helvetica,Arial,sans-serif;color:rgba(232,232,232,0.45);font-size:12.5px;line-height:1.6;margin:0;">Didn't request this? Simply ignore this email, no changes will be made to your account.</p></td></tr>
     </table>
   </td></tr>
   </table>
@@ -263,7 +263,7 @@ EMAIL_SAFETY = """<tr><td style="padding:8px 0 0;">
 
 EMAIL_FOOTER = """<tr><td style="padding:32px 0 0;border-top:1px solid rgba(255,255,255,0.08);margin-top:28px;">
   <p style="font-family:Helvetica,Arial,sans-serif;font-size:11px;line-height:1.6;color:rgba(232,232,232,0.28);margin:0;">
-    This is an automated message from EXE Account Services — replies to this address aren't monitored.
+    This is an automated message from EXE Account Services. Replies to this address aren't monitored.
   </p>
 </td></tr>"""
 
