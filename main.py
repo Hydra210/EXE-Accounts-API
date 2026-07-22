@@ -166,7 +166,14 @@ def send_email(to: str, subject: str, html: str) -> None:
         "https://api.resend.com/emails",
         data=payload,
         method="POST",
-        headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json",
+            # urllib's default User-Agent ("Python-urllib/3.x") gets flagged as a bot
+            # and blocked by Cloudflare (sitting in front of api.resend.com) before the
+            # request ever reaches Resend — a normal-looking UA avoids that.
+            "User-Agent": "Mozilla/5.0 (compatible; exe-accounts-api/1.0)",
+        },
     )
     try:
         with urllib.request.urlopen(req, timeout=8) as resp:
