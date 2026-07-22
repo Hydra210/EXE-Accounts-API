@@ -59,7 +59,7 @@ if os.path.isdir(_icons_dir):
 
 # Used as the <img src> in emails. Falls back to relative /icons/icon.png if
 # PUBLIC_APP_URL isn't set, which won't load in an inbox — set that env var.
-EMAIL_ICON_URL = f"{PUBLIC_APP_URL}/icons/icon.png" if PUBLIC_APP_URL else "/icons/icon.png"
+EMAIL_ICON_URL = f"{PUBLIC_APP_URL}/icons/logo.png" if PUBLIC_APP_URL else "/icons/logo.png"
 
 def get_conn():
     conn = db_pool.getconn()
