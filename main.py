@@ -23,6 +23,7 @@ JWT_SECRET            = os.environ["JWT_SECRET"]              # generate with se
 JWT_ALGO              = "HS256"
 ACCESS_TOKEN_MINUTES  = 15
 REFRESH_TOKEN_DAYS    = 30
+TWO_FACTOR_CODE_MINUTES = 10
 
 # First account registered with this email is auto-promoted to admin.
 # Set this to your own email before you register your first account.
@@ -83,6 +84,13 @@ class ResetPasswordBody(BaseModel):
     token: str
     new_password: str
 
+class Verify2FABody(BaseModel):
+    challenge_token: str
+    code: str
+
+class Toggle2FABody(BaseModel):
+    enabled: bool
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TOKEN HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -135,6 +143,35 @@ def require_admin(user=Depends(require_user), conn=Depends(get_conn)) -> dict:
     if not row or not row["is_admin"]:
         raise HTTPException(403, "Admin access required")
     return user
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2FA HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def _hash_code(code: str) -> str:
+    # Same principle as password/refresh-token storage — only the hash lives in the DB.
+    return hashlib.sha256(code.encode()).hexdigest()
+
+def make_2fa_challenge_token(user_id: str, app_name: Optional[str]) -> str:
+    # A short-lived token that stands in for "this person already proved their
+    # password" so the code-entry step doesn't need to re-send it. Carries the
+    # app name through so the eventual refresh token is still tagged correctly.
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": user_id, "kind": "2fa_login", "app": app_name,
+        "iat": now, "exp": now + timedelta(minutes=TWO_FACTOR_CODE_MINUTES),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+
+def decode_2fa_challenge(token: str) -> dict:
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(400, "This login attempt has expired — log in again")
+    except jwt.InvalidTokenError:
+        raise HTTPException(400, "Invalid login session — log in again")
+    if payload.get("kind") != "2fa_login":
+        raise HTTPException(400, "Invalid login session — log in again")
+    return payload
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EMAIL — verification + password reset
@@ -245,6 +282,72 @@ def send_password_reset_email(user_id: str, email: str) -> None:
     )
     send_email(email, "Reset your EXE account password", html)
 
+RESET_PAGE = """<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Reset Password</title>
+<style>
+  body {{ background:#0a0a0a; color:#e8e8e8; font-family:sans-serif; display:flex;
+          align-items:center; justify-content:center; height:100vh; margin:0; }}
+  .box {{ text-align:center; max-width:340px; width:100%; padding:32px; box-sizing:border-box; }}
+  h1 {{ font-size:18px; letter-spacing:1px; margin:0 0 18px; }}
+  input {{ width:100%; box-sizing:border-box; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.15);
+           color:#fff; padding:10px 12px; border-radius:6px; font-size:13px; margin-bottom:10px; outline:none; }}
+  button {{ width:100%; background:rgba(255,255,255,0.1); border:1px solid rgba(255,255,255,0.25); color:#fff;
+            padding:10px; border-radius:6px; font-weight:700; letter-spacing:1px; font-size:12px; cursor:pointer; text-transform:uppercase; }}
+  button:hover {{ background:rgba(255,255,255,0.16); }}
+  p.msg {{ font-size:13px; color:rgba(232,232,232,0.6); margin:14px 0 0; min-height:16px; }}
+  p.msg.err {{ color:#ff6b6b; }}
+  p.msg.ok {{ color:#7ee89a; }}
+</style></head>
+<body>
+  <div class="box">
+    <h1>Reset your password</h1>
+    <input id="pw" type="password" placeholder="New password">
+    <input id="pw2" type="password" placeholder="Confirm new password">
+    <button onclick="submitReset()">Reset Password</button>
+    <p class="msg" id="msg"></p>
+  </div>
+  <script>
+    const RESET_TOKEN = {token_json};
+    async function submitReset() {{
+      const pw = document.getElementById('pw').value;
+      const pw2 = document.getElementById('pw2').value;
+      const msg = document.getElementById('msg');
+      msg.className = 'msg';
+      if (!pw || pw.length < 8) {{ msg.className = 'msg err'; msg.textContent = 'Password must be at least 8 characters.'; return; }}
+      if (pw !== pw2) {{ msg.className = 'msg err'; msg.textContent = 'Passwords do not match.'; return; }}
+      try {{
+        const res = await fetch('/auth/reset-password', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ token: RESET_TOKEN, new_password: pw }}),
+        }});
+        const data = await res.json().catch(() => ({{}}));
+        if (!res.ok) throw new Error(data.detail || 'Reset failed');
+        msg.className = 'msg ok';
+        msg.textContent = 'Password updated — you can close this tab and log in.';
+        document.getElementById('pw').disabled = true;
+        document.getElementById('pw2').disabled = true;
+      }} catch (e) {{
+        msg.className = 'msg err';
+        msg.textContent = e.message;
+      }}
+    }}
+  </script>
+</body></html>"""
+
+CODE_EMAIL_TEMPLATE = """<div style="background:#0a0a0a;padding:40px 20px;font-family:sans-serif;">
+  <div style="max-width:420px;margin:0 auto;background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:10px;padding:32px;text-align:center;">
+    <h1 style="color:#e8e8e8;font-size:18px;letter-spacing:1px;margin:0 0 12px;">Your login code</h1>
+    <p style="color:rgba(232,232,232,0.6);font-size:14px;line-height:1.5;margin:0 0 24px;">Enter this code to finish logging in.</p>
+    <div style="display:inline-block;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.15);border-radius:8px;padding:16px 28px;font-family:monospace;font-size:28px;letter-spacing:8px;color:#fff;">{code}</div>
+    <p style="color:rgba(232,232,232,0.3);font-size:11px;margin:24px 0 0;">Expires in {minutes} minutes. If this wasn't you, ignore this email.</p>
+  </div>
+</div>"""
+
+def send_login_code_email(email: str, code: str) -> None:
+    html = CODE_EMAIL_TEMPLATE.format(code=code, minutes=TWO_FACTOR_CODE_MINUTES)
+    send_email(email, "Your EXE login code", html)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ROUTES — AUTH
 # ─────────────────────────────────────────────────────────────────────────────
@@ -277,8 +380,8 @@ def register(body: RegisterBody, conn=Depends(get_conn)):
 def login(body: LoginBody, conn=Depends(get_conn)):
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
-            "SELECT id, email, display_name, password_hash, email_verified, is_admin, status, created_at "
-            "FROM exe_users WHERE email = %s",
+            "SELECT id, email, display_name, password_hash, email_verified, is_admin, status, "
+            "created_at, two_factor_enabled FROM exe_users WHERE email = %s",
             (body.email,),
         )
         user = cur.fetchone()
@@ -294,6 +397,23 @@ def login(body: LoginBody, conn=Depends(get_conn)):
         send_verification_email(str(user["id"]), user["email"])
         raise HTTPException(403, "Your account email needs to be verified — we sent an email to the address associated with this account")
 
+    if user["two_factor_enabled"]:
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=TWO_FACTOR_CODE_MINUTES)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO exe_login_codes (user_id, code_hash, expires_at) VALUES (%s, %s, %s)",
+                (str(user["id"]), _hash_code(code), expires_at),
+            )
+        conn.commit()
+        send_login_code_email(user["email"], code)
+        challenge_token = make_2fa_challenge_token(str(user["id"]), body.app)
+        return {
+            "requires_2fa": True,
+            "challenge_token": challenge_token,
+            "message": "We sent a login code to your email",
+        }
+
     del user["password_hash"]
     access_token = make_access_token(str(user["id"]), user["email"])
     refresh_token = make_refresh_token(conn, str(user["id"]), body.app)
@@ -304,6 +424,61 @@ def login(body: LoginBody, conn=Depends(get_conn)):
         "refresh_token": refresh_token,
         "token_type": "bearer",
     }
+
+@app.post("/auth/verify-2fa")
+def verify_2fa(body: Verify2FABody, conn=Depends(get_conn)):
+    payload = decode_2fa_challenge(body.challenge_token)
+    user_id = payload["sub"]
+    submitted_hash = _hash_code(body.code.strip())
+
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT id, code_hash FROM exe_login_codes WHERE user_id = %s AND consumed_at IS NULL "
+            "AND expires_at > now() ORDER BY created_at DESC LIMIT 1",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        if not row or not secrets.compare_digest(row["code_hash"], submitted_hash):
+            raise HTTPException(400, "Incorrect or expired code")
+
+        cur.execute("UPDATE exe_login_codes SET consumed_at = now() WHERE id = %s", (row["id"],))
+        cur.execute(
+            "SELECT id, email, display_name, email_verified, is_admin, status, created_at, "
+            "two_factor_enabled FROM exe_users WHERE id = %s",
+            (user_id,),
+        )
+        user = cur.fetchone()
+    conn.commit()
+
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    access_token = make_access_token(str(user["id"]), user["email"])
+    refresh_token = make_refresh_token(conn, str(user["id"]), payload.get("app"))
+
+    return {
+        "user": user,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+    }
+
+@app.post("/auth/2fa/toggle")
+def toggle_2fa(body: Toggle2FABody, user=Depends(require_user), conn=Depends(get_conn)):
+    # Lets a consuming site expose an account-settings toggle. The admin panel
+    # doesn't have a settings screen, so it never calls this — 2FA just stays
+    # on by default there.
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "UPDATE exe_users SET two_factor_enabled = %s, updated_at = now() WHERE id = %s "
+            "RETURNING id, two_factor_enabled",
+            (body.enabled, user["sub"]),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    if not row:
+        raise HTTPException(404, "User not found")
+    return row
 
 @app.post("/auth/refresh")
 def refresh(body: RefreshBody, conn=Depends(get_conn)):
@@ -401,11 +576,16 @@ def reset_password(body: ResetPasswordBody, conn=Depends(get_conn)):
     conn.commit()
     return {"ok": True, "message": "Password updated — log in again"}
 
+@app.get("/reset-password", response_class=HTMLResponse)
+def reset_password_page(token: str):
+    return RESET_PAGE.format(token_json=json.dumps(token))
+
 @app.get("/auth/me")
 def me(user=Depends(require_user), conn=Depends(get_conn)):
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
-            "SELECT id, email, display_name, email_verified, is_admin, status, created_at FROM exe_users WHERE id = %s",
+            "SELECT id, email, display_name, email_verified, is_admin, status, created_at, "
+            "two_factor_enabled FROM exe_users WHERE id = %s",
             (user["sub"],),
         )
         row = cur.fetchone()
