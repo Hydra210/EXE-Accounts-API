@@ -12,6 +12,7 @@ import psycopg2.extras
 from psycopg2 import pool as pg_pool
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
 
@@ -159,11 +160,11 @@ def decode_action_token(token: str, expected_kind: str) -> str:
         raise HTTPException(400, "This link is invalid")
     return payload["sub"]
 
-def send_email(to: str, subject: str, body: str) -> None:
+def send_email(to: str, subject: str, body: str, html: bool = False) -> None:
     if not SMTP_USER or not SMTP_PASSWORD:
         print(f"[mailer] SMTP not configured — skipping email to {to}: {subject}")
         return
-    msg = MIMEText(body)
+    msg = MIMEText(body, "html" if html else "plain")
     msg["Subject"] = subject
     msg["From"] = MAIL_FROM
     msg["To"] = to
@@ -176,10 +177,30 @@ def send_email(to: str, subject: str, body: str) -> None:
         # Best-effort — a failed email shouldn't take down register/login.
         print(f"[mailer] failed to send to {to}: {e}")
 
+VERIFY_EMAIL_HTML = """<div style="background:#0a0a0a;padding:40px 20px;font-family:sans-serif;">
+  <div style="max-width:420px;margin:0 auto;background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:10px;padding:32px;text-align:center;">
+    <h1 style="color:#e8e8e8;font-size:18px;letter-spacing:1px;margin:0 0 12px;">Verify your EXE account</h1>
+    <p style="color:rgba(232,232,232,0.6);font-size:14px;line-height:1.5;margin:0 0 24px;">Click below to verify this email address. This link expires in 24 hours.</p>
+    <a href="{link}" style="display:inline-block;background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.25);color:#fff;padding:12px 28px;border-radius:6px;text-decoration:none;font-weight:700;letter-spacing:1px;font-size:13px;">VERIFY EMAIL</a>
+    <p style="color:rgba(232,232,232,0.3);font-size:11px;margin:24px 0 0;">If the button doesn't work, paste this link into your browser:<br>{link}</p>
+  </div>
+</div>"""
+
 def send_verification_email(user_id: str, email: str) -> None:
     token = make_action_token(user_id, "verify_email", minutes=60 * 24)
     link = f"{PUBLIC_APP_URL}/auth/verify-email?token={token}" if PUBLIC_APP_URL else f"(set PUBLIC_APP_URL) /auth/verify-email?token={token}"
-    send_email(email, "Verify your EXE account", f"Verify your email:\n\n{link}\n\nExpires in 24 hours.")
+    send_email(email, "Verify your EXE account", VERIFY_EMAIL_HTML.format(link=link), html=True)
+
+VERIFY_PAGE = """<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>EXE Account</title>
+<style>
+  body {{ background:#0a0a0a; color:#e8e8e8; font-family:sans-serif; display:flex;
+          align-items:center; justify-content:center; height:100vh; margin:0; }}
+  .box {{ text-align:center; max-width:380px; padding:32px; }}
+  h1 {{ font-size:20px; letter-spacing:1px; margin-bottom:10px; color:{color}; }}
+  p {{ font-size:14px; color:rgba(232,232,232,0.6); }}
+</style></head>
+<body><div class="box"><h1>{title}</h1><p>{message}</p></div></body></html>"""
 
 def send_password_reset_email(user_id: str, email: str) -> None:
     token = make_action_token(user_id, "pwd_reset", minutes=60)
@@ -209,14 +230,9 @@ def register(body: RegisterBody, conn=Depends(get_conn)):
 
     send_verification_email(str(user["id"]), user["email"])
 
-    access_token = make_access_token(str(user["id"]), user["email"])
-    refresh_token = make_refresh_token(conn, str(user["id"]), body.app)
-
     return {
         "user": user,
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "token_type": "bearer",
+        "message": "Account created — check your email to verify it before logging in",
     }
 
 @app.post("/auth/login")
@@ -236,6 +252,9 @@ def login(body: LoginBody, conn=Depends(get_conn)):
         raise HTTPException(403, "This account is on hold — contact support")
     if user["status"] == "terminated":
         raise HTTPException(403, "This account has been terminated")
+    if not user["email_verified"]:
+        send_verification_email(str(user["id"]), user["email"])
+        raise HTTPException(403, "Your account email needs to be verified — we sent an email to the address associated with this account")
 
     del user["password_hash"]
     access_token = make_access_token(str(user["id"]), user["email"])
@@ -303,13 +322,17 @@ def logout(body: LogoutBody, conn=Depends(get_conn)):
     conn.commit()
     return {"ok": True}
 
-@app.get("/auth/verify-email")
+@app.get("/auth/verify-email", response_class=HTMLResponse)
 def verify_email(token: str, conn=Depends(get_conn)):
-    user_id = decode_action_token(token, "verify_email")
+    try:
+        user_id = decode_action_token(token, "verify_email")
+    except HTTPException as e:
+        return VERIFY_PAGE.format(title="Link invalid", message=e.detail, color="#ff6b6b")
+
     with conn.cursor() as cur:
         cur.execute("UPDATE exe_users SET email_verified = TRUE, updated_at = now() WHERE id = %s", (user_id,))
     conn.commit()
-    return {"ok": True, "message": "Email verified"}
+    return VERIFY_PAGE.format(title="Email verified", message="You're all set — you can close this tab and log in now.", color="#7ee89a")
 
 @app.post("/auth/forgot-password")
 def forgot_password(body: ForgotPasswordBody, conn=Depends(get_conn)):
