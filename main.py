@@ -213,10 +213,27 @@ VERIFY_PAGE = """<!DOCTYPE html>
   body {{ background:#0a0a0a; color:#e8e8e8; font-family:sans-serif; display:flex;
           align-items:center; justify-content:center; height:100vh; margin:0; }}
   .box {{ text-align:center; max-width:380px; padding:32px; }}
+  .spinner {{ width:32px; height:32px; margin:0 auto 22px; border-radius:50%;
+              border:3px solid rgba(255,255,255,0.12); border-top-color:rgba(255,255,255,0.6);
+              animation: spin 0.8s linear infinite; }}
+  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+  .result {{ opacity:0; transition: opacity 0.35s ease; }}
+  .result.show {{ opacity:1; }}
   h1 {{ font-size:20px; letter-spacing:1px; margin-bottom:10px; color:{color}; }}
   p {{ font-size:14px; color:rgba(232,232,232,0.6); }}
 </style></head>
-<body><div class="box"><h1>{title}</h1><p>{message}</p></div></body></html>"""
+<body>
+  <div class="box">
+    <div class="spinner" id="spinner"></div>
+    <div class="result" id="result"><h1>{title}</h1><p>{message}</p></div>
+  </div>
+  <script>
+    setTimeout(function () {{
+      document.getElementById('spinner').style.display = 'none';
+      document.getElementById('result').classList.add('show');
+    }}, 900);
+  </script>
+</body></html>"""
 
 def send_password_reset_email(user_id: str, email: str) -> None:
     token = make_action_token(user_id, "pwd_reset", minutes=60)
@@ -353,7 +370,7 @@ def verify_email(token: str, conn=Depends(get_conn)):
     with conn.cursor() as cur:
         cur.execute("UPDATE exe_users SET email_verified = TRUE, updated_at = now() WHERE id = %s", (user_id,))
     conn.commit()
-    return VERIFY_PAGE.format(title="Email verified", message="You're all set — you can close this tab and log in now.", color="#7ee89a")
+    return VERIFY_PAGE.format(title="Verified successfully", message="You're all set — you can close this tab and log in now.", color="#7ee89a")
 
 @app.post("/auth/forgot-password")
 def forgot_password(body: ForgotPasswordBody, conn=Depends(get_conn)):
