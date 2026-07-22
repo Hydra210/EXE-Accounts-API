@@ -1,8 +1,7 @@
 # EXE ACCOUNT API — Centralized Auth for EXE Development
 # Start command: uvicorn main:app --host 0.0.0.0 --port $PORT
 from __future__ import annotations
-import os, secrets, hashlib, smtplib
-from email.mime.text import MIMEText
+import os, secrets, hashlib, json, urllib.request, urllib.error
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -29,15 +28,13 @@ REFRESH_TOKEN_DAYS    = 30
 # Set this to your own email before you register your first account.
 ADMIN_BOOTSTRAP_EMAIL = os.environ.get("ADMIN_BOOTSTRAP_EMAIL", "").lower().strip()
 
-# Gmail SMTP (using a Google account as the mailer until there's a proper
-# transactional email provider). Gmail requires an App Password, not your
-# normal login password — generate one at myaccount.google.com/apppasswords
-# (needs 2FA turned on for that Google account first).
-SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USER = os.environ.get("SMTP_USER", "")
-SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
-MAIL_FROM = os.environ.get("MAIL_FROM", SMTP_USER)
+# Resend (transactional email over HTTPS). Render's free web services block
+# outbound SMTP ports (25/465/587), so plain smtplib mail doesn't work there —
+# Resend's API runs over normal HTTPS instead. Get a key at resend.com/api-keys.
+# MAIL_FROM must be an address on a domain you've verified with Resend, or use
+# their shared "onboarding@resend.dev" sender for testing.
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+MAIL_FROM = os.environ.get("MAIL_FROM", "EXE Accounts <onboarding@resend.dev>")
 PUBLIC_APP_URL = os.environ.get("PUBLIC_APP_URL", "")  # used to build verify/reset links
 
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -160,28 +157,29 @@ def decode_action_token(token: str, expected_kind: str) -> str:
         raise HTTPException(400, "This link is invalid")
     return payload["sub"]
 
-def send_email(to: str, subject: str, body: str, html: bool = False) -> None:
-    if not SMTP_USER or not SMTP_PASSWORD:
-        print(f"[mailer] SMTP not configured — skipping email to {to}: {subject}")
+def send_email(to: str, subject: str, html: str) -> None:
+    if not RESEND_API_KEY:
+        print(f"[mailer] RESEND_API_KEY not configured — skipping email to {to}: {subject}")
         return
-    msg = MIMEText(body, "html" if html else "plain")
-    msg["Subject"] = subject
-    msg["From"] = MAIL_FROM
-    msg["To"] = to
+    payload = json.dumps({"from": MAIL_FROM, "to": [to], "subject": subject, "html": html}).encode()
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=payload,
+        method="POST",
+        headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+    )
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.sendmail(MAIL_FROM, [to], msg.as_string())
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            resp.read()
     except Exception as e:
         # Best-effort — a failed email shouldn't take down register/login.
         print(f"[mailer] failed to send to {to}: {e}")
 
-VERIFY_EMAIL_HTML = """<div style="background:#0a0a0a;padding:40px 20px;font-family:sans-serif;">
+EMAIL_TEMPLATE = """<div style="background:#0a0a0a;padding:40px 20px;font-family:sans-serif;">
   <div style="max-width:420px;margin:0 auto;background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:10px;padding:32px;text-align:center;">
-    <h1 style="color:#e8e8e8;font-size:18px;letter-spacing:1px;margin:0 0 12px;">Verify your EXE account</h1>
-    <p style="color:rgba(232,232,232,0.6);font-size:14px;line-height:1.5;margin:0 0 24px;">Click below to verify this email address. This link expires in 24 hours.</p>
-    <a href="{link}" style="display:inline-block;background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.25);color:#fff;padding:12px 28px;border-radius:6px;text-decoration:none;font-weight:700;letter-spacing:1px;font-size:13px;">VERIFY EMAIL</a>
+    <h1 style="color:#e8e8e8;font-size:18px;letter-spacing:1px;margin:0 0 12px;">{title}</h1>
+    <p style="color:rgba(232,232,232,0.6);font-size:14px;line-height:1.5;margin:0 0 24px;">{message}</p>
+    <a href="{link}" style="display:inline-block;background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.25);color:#fff;padding:12px 28px;border-radius:6px;text-decoration:none;font-weight:700;letter-spacing:1px;font-size:13px;">{button_label}</a>
     <p style="color:rgba(232,232,232,0.3);font-size:11px;margin:24px 0 0;">If the button doesn't work, paste this link into your browser:<br>{link}</p>
   </div>
 </div>"""
@@ -189,7 +187,12 @@ VERIFY_EMAIL_HTML = """<div style="background:#0a0a0a;padding:40px 20px;font-fam
 def send_verification_email(user_id: str, email: str) -> None:
     token = make_action_token(user_id, "verify_email", minutes=60 * 24)
     link = f"{PUBLIC_APP_URL}/auth/verify-email?token={token}" if PUBLIC_APP_URL else f"(set PUBLIC_APP_URL) /auth/verify-email?token={token}"
-    send_email(email, "Verify your EXE account", VERIFY_EMAIL_HTML.format(link=link), html=True)
+    html = EMAIL_TEMPLATE.format(
+        title="Verify your EXE account",
+        message="Click below to verify this email address. This link expires in 24 hours.",
+        link=link, button_label="VERIFY EMAIL",
+    )
+    send_email(email, "Verify your EXE account", html)
 
 VERIFY_PAGE = """<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>EXE Account</title>
@@ -205,7 +208,12 @@ VERIFY_PAGE = """<!DOCTYPE html>
 def send_password_reset_email(user_id: str, email: str) -> None:
     token = make_action_token(user_id, "pwd_reset", minutes=60)
     link = f"{PUBLIC_APP_URL}/reset-password?token={token}" if PUBLIC_APP_URL else f"(set PUBLIC_APP_URL) /reset-password?token={token}"
-    send_email(email, "Reset your EXE account password", f"Reset your password:\n\n{link}\n\nExpires in 1 hour. If you didn't request this, ignore this email.")
+    html = EMAIL_TEMPLATE.format(
+        title="Reset your EXE account password",
+        message="Click below to reset your password. This link expires in 1 hour. If you didn't request this, ignore this email.",
+        link=link, button_label="RESET PASSWORD",
+    )
+    send_email(email, "Reset your EXE account password", html)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ROUTES — AUTH
