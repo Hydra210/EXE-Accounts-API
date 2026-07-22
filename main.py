@@ -177,11 +177,11 @@ def decode_2fa_challenge(token: str) -> dict:
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
     except jwt.ExpiredSignatureError:
-        raise HTTPException(400, "This login attempt has expired — log in again")
+        raise HTTPException(400, "This login attempt has expired. Log in again")
     except jwt.InvalidTokenError:
-        raise HTTPException(400, "Invalid login session — log in again")
+        raise HTTPException(400, "Invalid login session. Log in again")
     if payload.get("kind") != "2fa_login":
-        raise HTTPException(400, "Invalid login session — log in again")
+        raise HTTPException(400, "Invalid login session. Log in again")
     return payload
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -198,7 +198,7 @@ def decode_action_token(token: str, expected_kind: str) -> str:
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
     except jwt.ExpiredSignatureError:
-        raise HTTPException(400, "This link has expired — request a new one")
+        raise HTTPException(400, "This link has expired. Request a new one")
     except jwt.InvalidTokenError:
         raise HTTPException(400, "This link is invalid")
     if payload.get("kind") != expected_kind:
@@ -207,7 +207,7 @@ def decode_action_token(token: str, expected_kind: str) -> str:
 
 def send_email(to: str, subject: str, html: str) -> None:
     if not RESEND_API_KEY:
-        print(f"[mailer] RESEND_API_KEY not configured — skipping email to {to}: {subject}")
+        print(f"[mailer] RESEND_API_KEY not configured. Skipping email to {to}: {subject}")
         return
     payload = json.dumps({"from": MAIL_FROM, "to": [to], "subject": subject, "html": html}).encode()
     req = urllib.request.Request(
@@ -241,8 +241,8 @@ def send_email(to: str, subject: str, html: str) -> None:
 # Inline styles only + safe font stacks — most email clients strip <link>
 # stylesheets, so this can't actually load Syne/Outfit/DM Mono, it just
 # mimics their proportions with system fonts.
-EMAIL_HEADER = """<tr><td style="background:#000000;padding:32px 20px;text-align:center;">
-  <img src=\"""" + EMAIL_ICON_URL + """\" alt="EXE" width="34" height="34" style="display:inline-block;border-radius:7px;">
+EMAIL_HEADER = """<tr><td style="padding:0;line-height:0;font-size:0;">
+  <img src=\"""" + EMAIL_ICON_URL + """\" alt="EXE" width="600" style="display:block;width:100%;max-width:600px;height:auto;">
 </td></tr>"""
 
 EMAIL_SAFETY = """<tr><td style="padding:8px 0 0;">
@@ -334,7 +334,7 @@ def send_password_reset_email(user_id: str, email: str) -> None:
     html = EMAIL_TEMPLATE.format(
         eyebrow="Password Reset",
         title="Reset your EXE account password",
-        message="Click below to reset your password. This link expires in 1 hour. If you didn't request this, ignore this email.",
+        message="Click below to reset your password. This link expires in 1 hour. If you didn't request this, simply ignore this email.",
         link=link, button_label="RESET PASSWORD",
     )
     send_email(email, "Reset your EXE account password", html)
@@ -381,7 +381,7 @@ RESET_PAGE = """<!DOCTYPE html>
         const data = await res.json().catch(() => ({{}}));
         if (!res.ok) throw new Error(data.detail || 'Reset failed');
         msg.className = 'msg ok';
-        msg.textContent = 'Password updated — you can close this tab and log in.';
+        msg.textContent = 'Password updated. You can close this tab and log in.';
         document.getElementById('pw').disabled = true;
         document.getElementById('pw2').disabled = true;
       }} catch (e) {{
@@ -404,7 +404,7 @@ CODE_EMAIL_TEMPLATE = """<!DOCTYPE html>
   <h1 style="font-family:Helvetica,Arial,sans-serif;color:#f5f5f5;font-size:22px;font-weight:700;letter-spacing:0.2px;margin:0 0 14px;">Your login code</h1>
   <p style="font-family:Helvetica,Arial,sans-serif;color:rgba(232,232,232,0.55);font-size:14px;line-height:1.6;margin:0 0 26px;">Enter this code to finish signing in to your EXE account.</p>
   <p style="font-family:'Courier New',monospace;font-size:36px;font-weight:700;letter-spacing:12px;color:#fff;margin:0 0 26px;">{code}</p>
-  <p style="font-family:Helvetica,Arial,sans-serif;color:rgba(232,232,232,0.3);font-size:11px;line-height:1.6;margin:24px 0 0;">Expires in {minutes} minutes.<br>If this wasn't you, you can safely ignore this email.</p>
+  <p style="font-family:Helvetica,Arial,sans-serif;color:rgba(232,232,232,0.3);font-size:11px;line-height:1.6;margin:24px 0 0;">Expires in {minutes} minutes.<br>If this wasn't you, you can simply ignore this email.</p>
 </td></tr>
 """ + EMAIL_SAFETY + EMAIL_FOOTER + """
 </table>
@@ -441,7 +441,7 @@ def register(body: RegisterBody, conn=Depends(get_conn)):
 
     return {
         "user": user,
-        "message": "Account created — check your email to verify it before logging in",
+        "message": "Account created. Check your email to verify it before logging in",
     }
 
 @app.post("/auth/login")
@@ -458,12 +458,12 @@ def login(body: LoginBody, conn=Depends(get_conn)):
         raise HTTPException(401, "Incorrect email or password")
 
     if user["status"] == "held":
-        raise HTTPException(403, "This account is on hold — contact support")
+        raise HTTPException(403, "This account is on hold. Contact support")
     if user["status"] == "terminated":
         raise HTTPException(403, "This account has been terminated")
     if not user["email_verified"]:
         send_verification_email(str(user["id"]), user["email"])
-        raise HTTPException(403, "Your account email needs to be verified — we sent an email to the address associated with this account")
+        raise HTTPException(403, "Your account email needs to be verified. We sent an email to the address associated with this account")
 
     if user["two_factor_enabled"]:
         code = f"{secrets.randbelow(1_000_000):06d}"
@@ -563,7 +563,7 @@ def refresh(body: RefreshBody, conn=Depends(get_conn)):
         if not row or row["revoked_at"] is not None:
             raise HTTPException(401, "Refresh token is invalid or has been revoked")
         if row["expires_at"] < datetime.now(timezone.utc):
-            raise HTTPException(401, "Refresh token has expired — please log in again")
+            raise HTTPException(401, "Refresh token has expired. Please log in again")
 
         # Rotation: kill the old one the instant a new one is issued.
         cur.execute(
@@ -578,7 +578,7 @@ def refresh(body: RefreshBody, conn=Depends(get_conn)):
     if not user_row:
         raise HTTPException(401, "User no longer exists")
     if user_row["status"] == "held":
-        raise HTTPException(403, "This account is on hold — contact support")
+        raise HTTPException(403, "This account is on hold. Contact support")
     if user_row["status"] == "terminated":
         raise HTTPException(403, "This account has been terminated")
 
@@ -613,7 +613,7 @@ def verify_email(token: str, conn=Depends(get_conn)):
     with conn.cursor() as cur:
         cur.execute("UPDATE exe_users SET email_verified = TRUE, updated_at = now() WHERE id = %s", (user_id,))
     conn.commit()
-    return VERIFY_PAGE.format(title="Verified successfully", message="You're all set — you can close this tab and log in now.", color="#7ee89a")
+    return VERIFY_PAGE.format(title="Verified successfully", message="You're all set. You can close this tab and log in now.", color="#7ee89a")
 
 @app.post("/auth/forgot-password")
 def forgot_password(body: ForgotPasswordBody, conn=Depends(get_conn)):
@@ -642,7 +642,7 @@ def reset_password(body: ResetPasswordBody, conn=Depends(get_conn)):
             (user_id,),
         )
     conn.commit()
-    return {"ok": True, "message": "Password updated — log in again"}
+    return {"ok": True, "message": "Password updated. Log in again"}
 
 @app.get("/reset-password", response_class=HTMLResponse)
 def reset_password_page(token: str):
