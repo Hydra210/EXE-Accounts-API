@@ -12,6 +12,7 @@ from psycopg2 import pool as pg_pool
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
 
@@ -49,6 +50,16 @@ app.add_middleware(
 )
 
 db_pool = pg_pool.SimpleConnectionPool(1, 10, dsn=DATABASE_URL)
+
+# Serves the /icons folder at <API_URL>/icons/... — needed so email clients
+# (which can't load local repo files) can actually fetch icon.png over HTTPS.
+_icons_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons")
+if os.path.isdir(_icons_dir):
+    app.mount("/icons", StaticFiles(directory=_icons_dir), name="icons")
+
+# Used as the <img src> in emails. Falls back to relative /icons/icon.png if
+# PUBLIC_APP_URL isn't set, which won't load in an inbox — set that env var.
+EMAIL_ICON_URL = f"{PUBLIC_APP_URL}/icons/icon.png" if PUBLIC_APP_URL else "/icons/icon.png"
 
 def get_conn():
     conn = db_pool.getconn()
@@ -225,19 +236,64 @@ def send_email(to: str, subject: str, html: str) -> None:
         # Best-effort — a failed email shouldn't take down register/login.
         print(f"[mailer] failed to send to {to}: {e}")
 
-EMAIL_TEMPLATE = """<div style="background:#0a0a0a;padding:40px 20px;font-family:sans-serif;">
-  <div style="max-width:420px;margin:0 auto;background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:10px;padding:32px;text-align:center;">
-    <h1 style="color:#e8e8e8;font-size:18px;letter-spacing:1px;margin:0 0 12px;">{title}</h1>
-    <p style="color:rgba(232,232,232,0.6);font-size:14px;line-height:1.5;margin:0 0 24px;">{message}</p>
-    <a href="{link}" style="display:inline-block;background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.25);color:#fff;padding:12px 28px;border-radius:6px;text-decoration:none;font-weight:700;letter-spacing:1px;font-size:13px;">{button_label}</a>
-    <p style="color:rgba(232,232,232,0.3);font-size:11px;margin:24px 0 0;">If the button doesn't work, paste this link into your browser:<br>{link}</p>
-  </div>
-</div>"""
+# Shared visual language across all transactional emails: dark card, small
+# uppercase "SENTINEL" wordmark, monochrome CTA button, muted footer.
+# Inline styles only + safe font stacks — most email clients strip <link>
+# stylesheets, so this can't actually load Syne/Outfit/DM Mono, it just
+# mimics their proportions with system fonts.
+EMAIL_HEADER = """<tr><td style="background:#000000;padding:32px 20px;text-align:center;">
+  <img src=\"""" + EMAIL_ICON_URL + """\" alt="EXE" width="34" height="34" style="display:inline-block;border-radius:7px;">
+</td></tr>"""
+
+EMAIL_SAFETY = """<tr><td style="padding:8px 0 0;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-top:1px solid rgba(255,255,255,0.08);margin-top:12px;">
+  <tr><td style="padding:28px 0 0;">
+    <p style="font-family:'Courier New',monospace;color:rgba(232,232,232,0.35);font-size:10.5px;letter-spacing:2px;text-transform:uppercase;margin:0 0 14px;">Account Safety</p>
+    <table role="presentation" cellpadding="0" cellspacing="0" width="100%">
+      <tr><td style="padding:0 0 10px;vertical-align:top;width:18px;"><span style="font-family:Helvetica,Arial,sans-serif;color:rgba(232,232,232,0.3);font-size:13px;">—</span></td>
+          <td style="padding:0 0 10px;"><p style="font-family:Helvetica,Arial,sans-serif;color:rgba(232,232,232,0.45);font-size:12.5px;line-height:1.6;margin:0;">EXE staff will never ask for your password, 2FA code, or ask you to move funds or items to "verify" an account.</p></td></tr>
+      <tr><td style="padding:0 0 10px;vertical-align:top;width:18px;"><span style="font-family:Helvetica,Arial,sans-serif;color:rgba(232,232,232,0.3);font-size:13px;">—</span></td>
+          <td style="padding:0 0 10px;"><p style="font-family:Helvetica,Arial,sans-serif;color:rgba(232,232,232,0.45);font-size:12.5px;line-height:1.6;margin:0;">Always check that links point to a domain you recognize before entering your credentials.</p></td></tr>
+      <tr><td style="padding:0;vertical-align:top;width:18px;"><span style="font-family:Helvetica,Arial,sans-serif;color:rgba(232,232,232,0.3);font-size:13px;">—</span></td>
+          <td style="padding:0;"><p style="font-family:Helvetica,Arial,sans-serif;color:rgba(232,232,232,0.45);font-size:12.5px;line-height:1.6;margin:0;">Didn't request this? Ignore this email — no changes will be made to your account.</p></td></tr>
+    </table>
+  </td></tr>
+  </table>
+</td></tr>"""
+
+EMAIL_FOOTER = """<tr><td style="padding:32px 0 0;border-top:1px solid rgba(255,255,255,0.08);margin-top:28px;">
+  <p style="font-family:Helvetica,Arial,sans-serif;font-size:11px;line-height:1.6;color:rgba(232,232,232,0.28);margin:0;">
+    This is an automated message from EXE Account Services — replies to this address aren't monitored.
+  </p>
+</td></tr>"""
+
+EMAIL_TEMPLATE = """<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#050505;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#050505;">
+""" + EMAIL_HEADER + """
+<tr><td align="center" style="padding:44px 20px 56px;">
+<table role="presentation" width="460" cellpadding="0" cellspacing="0" style="max-width:460px;width:100%;">
+<tr><td>
+  <p style="font-family:'Courier New',monospace;color:rgba(232,232,232,0.35);font-size:10.5px;letter-spacing:2px;text-transform:uppercase;margin:0 0 14px;">{eyebrow}</p>
+  <h1 style="font-family:Helvetica,Arial,sans-serif;color:#f5f5f5;font-size:22px;font-weight:700;letter-spacing:0.2px;margin:0 0 14px;">{title}</h1>
+  <p style="font-family:Helvetica,Arial,sans-serif;color:rgba(232,232,232,0.55);font-size:14px;line-height:1.6;margin:0 0 28px;">{message}</p>
+  <table role="presentation" cellpadding="0" cellspacing="0"><tr><td style="border-radius:7px;background:#f2f2f2;">
+    <a href="{link}" style="display:inline-block;color:#0a0a0a;padding:13px 30px;text-decoration:none;font-family:Helvetica,Arial,sans-serif;font-weight:700;letter-spacing:1px;font-size:12px;text-transform:uppercase;">{button_label}</a>
+  </td></tr></table>
+  <p style="font-family:'Courier New',monospace;color:rgba(232,232,232,0.25);font-size:11px;line-height:1.6;margin:28px 0 0;word-break:break-all;">If the button doesn't work, paste this link into your browser:<br>{link}</p>
+</td></tr>
+""" + EMAIL_SAFETY + EMAIL_FOOTER + """
+</table>
+</td></tr>
+</table>
+</body></html>"""
 
 def send_verification_email(user_id: str, email: str) -> None:
     token = make_action_token(user_id, "verify_email", minutes=60 * 24)
     link = f"{PUBLIC_APP_URL}/auth/verify-email?token={token}" if PUBLIC_APP_URL else f"(set PUBLIC_APP_URL) /auth/verify-email?token={token}"
     html = EMAIL_TEMPLATE.format(
+        eyebrow="Account Verification",
         title="Verify your EXE account",
         message="Click below to verify this email address. This link expires in 24 hours.",
         link=link, button_label="VERIFY EMAIL",
@@ -276,6 +332,7 @@ def send_password_reset_email(user_id: str, email: str) -> None:
     token = make_action_token(user_id, "pwd_reset", minutes=60)
     link = f"{PUBLIC_APP_URL}/reset-password?token={token}" if PUBLIC_APP_URL else f"(set PUBLIC_APP_URL) /reset-password?token={token}"
     html = EMAIL_TEMPLATE.format(
+        eyebrow="Password Reset",
         title="Reset your EXE account password",
         message="Click below to reset your password. This link expires in 1 hour. If you didn't request this, ignore this email.",
         link=link, button_label="RESET PASSWORD",
@@ -335,14 +392,25 @@ RESET_PAGE = """<!DOCTYPE html>
   </script>
 </body></html>"""
 
-CODE_EMAIL_TEMPLATE = """<div style="background:#0a0a0a;padding:40px 20px;font-family:sans-serif;">
-  <div style="max-width:420px;margin:0 auto;background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:10px;padding:32px;text-align:center;">
-    <h1 style="color:#e8e8e8;font-size:18px;letter-spacing:1px;margin:0 0 12px;">Your login code</h1>
-    <p style="color:rgba(232,232,232,0.6);font-size:14px;line-height:1.5;margin:0 0 24px;">Enter this code to finish logging in.</p>
-    <div style="display:inline-block;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.15);border-radius:8px;padding:16px 28px;font-family:monospace;font-size:28px;letter-spacing:8px;color:#fff;">{code}</div>
-    <p style="color:rgba(232,232,232,0.3);font-size:11px;margin:24px 0 0;">Expires in {minutes} minutes. If this wasn't you, ignore this email.</p>
-  </div>
-</div>"""
+CODE_EMAIL_TEMPLATE = """<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#050505;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#050505;">
+""" + EMAIL_HEADER + """
+<tr><td align="center" style="padding:44px 20px 56px;">
+<table role="presentation" width="460" cellpadding="0" cellspacing="0" style="max-width:460px;width:100%;">
+<tr><td>
+  <p style="font-family:'Courier New',monospace;color:rgba(232,232,232,0.35);font-size:10.5px;letter-spacing:2px;text-transform:uppercase;margin:0 0 14px;">Login Verification</p>
+  <h1 style="font-family:Helvetica,Arial,sans-serif;color:#f5f5f5;font-size:22px;font-weight:700;letter-spacing:0.2px;margin:0 0 14px;">Your login code</h1>
+  <p style="font-family:Helvetica,Arial,sans-serif;color:rgba(232,232,232,0.55);font-size:14px;line-height:1.6;margin:0 0 26px;">Enter this code to finish signing in to your EXE account.</p>
+  <p style="font-family:'Courier New',monospace;font-size:36px;font-weight:700;letter-spacing:12px;color:#fff;margin:0 0 26px;">{code}</p>
+  <p style="font-family:Helvetica,Arial,sans-serif;color:rgba(232,232,232,0.3);font-size:11px;line-height:1.6;margin:24px 0 0;">Expires in {minutes} minutes.<br>If this wasn't you, you can safely ignore this email.</p>
+</td></tr>
+""" + EMAIL_SAFETY + EMAIL_FOOTER + """
+</table>
+</td></tr>
+</table>
+</body></html>"""
 
 def send_login_code_email(email: str, code: str) -> None:
     html = CODE_EMAIL_TEMPLATE.format(code=code, minutes=TWO_FACTOR_CODE_MINUTES)
