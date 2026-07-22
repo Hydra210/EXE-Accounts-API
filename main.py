@@ -171,6 +171,12 @@ def send_email(to: str, subject: str, html: str) -> None:
     try:
         with urllib.request.urlopen(req, timeout=8) as resp:
             resp.read()
+    except urllib.error.HTTPError as e:
+        # Resend puts the real reason in the response body — the status code alone
+        # ("403 Forbidden") could mean an invalid key, an unverified domain, or the
+        # testing-only sandbox restriction, so surface the body to tell them apart.
+        detail = e.read().decode(errors="replace")
+        print(f"[mailer] failed to send to {to}: HTTP {e.code} — {detail}")
     except Exception as e:
         # Best-effort — a failed email shouldn't take down register/login.
         print(f"[mailer] failed to send to {to}: {e}")
