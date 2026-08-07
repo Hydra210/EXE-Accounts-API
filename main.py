@@ -486,8 +486,8 @@ def register(body: RegisterBody, conn=Depends(get_conn)):
 def login(body: LoginBody, request: Request, conn=Depends(get_conn)):
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
-            "SELECT id, email, display_name, password_hash, email_verified, is_admin, status, "
-            "created_at, two_factor_enabled FROM exe_users WHERE email = %s",
+            "SELECT id, email, display_name, avatar_url, password_hash, email_verified, is_admin, "
+            "status, created_at, two_factor_enabled FROM exe_users WHERE email = %s",
             (body.email,),
         )
         user = cur.fetchone()
@@ -552,8 +552,8 @@ def verify_2fa(body: Verify2FABody, request: Request, conn=Depends(get_conn)):
 
         cur.execute("UPDATE exe_login_codes SET consumed_at = now() WHERE id = %s", (row["id"],))
         cur.execute(
-            "SELECT id, email, display_name, email_verified, is_admin, status, created_at, "
-            "two_factor_enabled FROM exe_users WHERE id = %s",
+            "SELECT id, email, display_name, avatar_url, email_verified, is_admin, status, "
+            "created_at, two_factor_enabled FROM exe_users WHERE id = %s",
             (user_id,),
         )
         user = cur.fetchone()
@@ -592,7 +592,99 @@ def toggle_2fa(body: Toggle2FABody, user=Depends(require_user), conn=Depends(get
         raise HTTPException(404, "User not found")
     return row
 
-@app.post("/auth/refresh")
+@app.patch("/auth/me")
+def update_profile(body: UpdateProfileBody, user=Depends(require_user), conn=Depends(get_conn)):
+    # Both fields optional so the settings page can send just whichever one
+    # actually changed. COALESCE keeps the existing value when a field is
+    # omitted (None), rather than wiping it.
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "UPDATE exe_users SET "
+            "display_name = COALESCE(%s, display_name), "
+            "avatar_url = COALESCE(%s, avatar_url), "
+            "updated_at = now() "
+            "WHERE id = %s "
+            "RETURNING id, email, display_name, avatar_url, email_verified, is_admin, status, "
+            "created_at, two_factor_enabled",
+            (body.display_name, body.avatar_url, user["sub"]),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    if not row:
+        raise HTTPException(404, "User not found")
+    return row
+
+@app.post("/auth/change-password")
+def change_password(body: ChangePasswordBody, user=Depends(require_user), conn=Depends(get_conn)):
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT password_hash FROM exe_users WHERE id = %s", (user["sub"],))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "User not found")
+        if not pwd_ctx.verify(body.current_password, row["password_hash"]):
+            raise HTTPException(401, "Current password is incorrect")
+
+        new_hash = pwd_ctx.hash(body.new_password)
+        cur.execute(
+            "UPDATE exe_users SET password_hash = %s, updated_at = now() WHERE id = %s",
+            (new_hash, user["sub"]),
+        )
+        # Log out every other session on password change — standard practice,
+        # same as the forgot-password flow already does. The session making
+        # this request keeps working until its short-lived access token
+        # naturally expires, same as everywhere else in this API.
+        cur.execute(
+            "UPDATE exe_refresh_tokens SET revoked_at = now() "
+            "WHERE user_id = %s AND revoked_at IS NULL AND id != %s",
+            (user["sub"], user.get("sid")),
+        )
+    conn.commit()
+    return {"ok": True}
+
+@app.get("/auth/sessions")
+def list_sessions(user=Depends(require_user), conn=Depends(get_conn)):
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT id, app, user_agent, ip, created_at, last_used_at, expires_at "
+            "FROM exe_refresh_tokens "
+            "WHERE user_id = %s AND revoked_at IS NULL AND expires_at > now() "
+            "ORDER BY last_used_at DESC",
+            (user["sub"],),
+        )
+        rows = cur.fetchall()
+    current_sid = user.get("sid")
+    for r in rows:
+        r["is_current"] = str(r["id"]) == str(current_sid)
+        r["id"] = str(r["id"])
+    return rows
+
+@app.delete("/auth/sessions/{session_id}")
+def revoke_session(session_id: str, user=Depends(require_user), conn=Depends(get_conn)):
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE exe_refresh_tokens SET revoked_at = now() "
+            "WHERE id = %s AND user_id = %s AND revoked_at IS NULL",
+            (session_id, user["sub"]),
+        )
+        revoked = cur.rowcount
+    conn.commit()
+    if not revoked:
+        raise HTTPException(404, "Session not found")
+    return {"ok": True}
+
+@app.post("/auth/sessions/revoke-others")
+def revoke_other_sessions(user=Depends(require_user), conn=Depends(get_conn)):
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE exe_refresh_tokens SET revoked_at = now() "
+            "WHERE user_id = %s AND revoked_at IS NULL AND id != %s",
+            (user["sub"], user.get("sid")),
+        )
+        count = cur.rowcount
+    conn.commit()
+    return {"ok": True, "revoked": count}
+
+
 def refresh(body: RefreshBody, request: Request, conn=Depends(get_conn)):
     token_hash = _hash_refresh_token(body.refresh_token)
 
@@ -699,8 +791,8 @@ def reset_password_page(token: str):
 def me(user=Depends(require_user), conn=Depends(get_conn)):
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
-            "SELECT id, email, display_name, email_verified, is_admin, status, created_at, "
-            "two_factor_enabled FROM exe_users WHERE id = %s",
+            "SELECT id, email, display_name, avatar_url, email_verified, is_admin, status, "
+            "created_at, two_factor_enabled FROM exe_users WHERE id = %s",
             (user["sub"],),
         )
         row = cur.fetchone()
