@@ -651,7 +651,7 @@ def _r2_key_from_url(url: str) -> Optional[str]:
     prefix = f"{R2_PUBLIC_URL}/"
     return url[len(prefix):] if url.startswith(prefix) else None
 
-@app.post("/auth/me/avatar")
+@app.post("/auth/avatar")
 async def upload_avatar(file: UploadFile = File(...), user=Depends(require_user), conn=Depends(get_conn)):
     ext = ALLOWED_AVATAR_TYPES.get(file.content_type)
     if not ext:
@@ -702,6 +702,32 @@ async def upload_avatar(file: UploadFile = File(...), user=Depends(require_user)
 
     if not row:
         raise HTTPException(404, "User not found")
+    return row
+
+@app.delete("/auth/avatar")
+def delete_avatar(user=Depends(require_user), conn=Depends(get_conn)):
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT avatar_url FROM exe_users WHERE id = %s", (user["sub"],))
+        old = cur.fetchone()
+        if not old:
+            raise HTTPException(404, "User not found")
+
+        cur.execute(
+            "UPDATE exe_users SET avatar_url = NULL, updated_at = now() WHERE id = %s "
+            "RETURNING id, email, display_name, avatar_url, email_verified, is_admin, status, "
+            "created_at, two_factor_enabled",
+            (user["sub"],),
+        )
+        row = cur.fetchone()
+    conn.commit()
+
+    old_key = _r2_key_from_url(old["avatar_url"]) if old.get("avatar_url") else None
+    if old_key:
+        try:
+            r2.delete_object(Bucket=R2_BUCKET_NAME, Key=old_key)
+        except Exception:
+            pass
+
     return row
 
 @app.post("/auth/change-password")
