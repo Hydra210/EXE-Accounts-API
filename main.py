@@ -9,7 +9,7 @@ import jwt
 import psycopg2
 import psycopg2.extras
 from psycopg2 import pool as pg_pool
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -68,6 +68,23 @@ def get_conn():
     finally:
         db_pool.putconn(conn)
 
+@app.on_event("startup")
+def _run_migrations():
+    # ADD COLUMN IF NOT EXISTS is safe to re-run on every boot, so no separate
+    # migration step/tool is needed — new columns just show up the first time
+    # this deploys, and every boot after that is a no-op.
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("ALTER TABLE exe_users ADD COLUMN IF NOT EXISTS avatar_url TEXT")
+            cur.execute("ALTER TABLE exe_refresh_tokens ADD COLUMN IF NOT EXISTS user_agent TEXT")
+            cur.execute("ALTER TABLE exe_refresh_tokens ADD COLUMN IF NOT EXISTS ip TEXT")
+            cur.execute("ALTER TABLE exe_refresh_tokens ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now()")
+            cur.execute("ALTER TABLE exe_refresh_tokens ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ NOT NULL DEFAULT now()")
+        conn.commit()
+    finally:
+        db_pool.putconn(conn)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MODELS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -102,6 +119,14 @@ class Verify2FABody(BaseModel):
 class Toggle2FABody(BaseModel):
     enabled: bool
 
+class UpdateProfileBody(BaseModel):
+    display_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+
+class ChangePasswordBody(BaseModel):
+    current_password: str
+    new_password: str
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TOKEN HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -110,28 +135,41 @@ def _hash_refresh_token(raw: str) -> str:
     # same principle as password storage, so a DB leak alone isn't a session leak.
     return hashlib.sha256(raw.encode()).hexdigest()
 
-def make_access_token(user_id: str, email: str) -> str:
+def make_access_token(user_id: str, email: str, session_id: Optional[str] = None) -> str:
     now = datetime.now(timezone.utc)
     payload = {
         "sub": user_id,
         "email": email,
+        "sid": session_id,  # ties this access token back to a specific refresh-token row
         "iat": now,
         "exp": now + timedelta(minutes=ACCESS_TOKEN_MINUTES),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
 
-def make_refresh_token(conn, user_id: str, app_name: Optional[str]) -> str:
+def make_refresh_token(
+    conn, user_id: str, app_name: Optional[str],
+    user_agent: Optional[str] = None, ip: Optional[str] = None,
+) -> tuple[str, str]:
     raw = secrets.token_urlsafe(48)
     token_hash = _hash_refresh_token(raw)
     expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_DAYS)
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO exe_refresh_tokens (user_id, token_hash, app, expires_at) "
-            "VALUES (%s, %s, %s, %s)",
-            (user_id, token_hash, app_name, expires_at),
+            "INSERT INTO exe_refresh_tokens (user_id, token_hash, app, expires_at, user_agent, ip) "
+            "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+            (user_id, token_hash, app_name, expires_at, user_agent, ip),
         )
+        token_id = cur.fetchone()[0]
     conn.commit()
-    return raw
+    return raw, str(token_id)
+
+def _client_ip(request: Request) -> Optional[str]:
+    # Prefer a forwarded-for header (Render, Cloudflare, etc. sit in front),
+    # fall back to the raw connection if nothing forwarded it.
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else None
 
 def decode_access_token(token: str) -> dict:
     try:
@@ -445,7 +483,7 @@ def register(body: RegisterBody, conn=Depends(get_conn)):
     }
 
 @app.post("/auth/login")
-def login(body: LoginBody, conn=Depends(get_conn)):
+def login(body: LoginBody, request: Request, conn=Depends(get_conn)):
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
             "SELECT id, email, display_name, password_hash, email_verified, is_admin, status, "
@@ -483,8 +521,11 @@ def login(body: LoginBody, conn=Depends(get_conn)):
         }
 
     del user["password_hash"]
-    access_token = make_access_token(str(user["id"]), user["email"])
-    refresh_token = make_refresh_token(conn, str(user["id"]), body.app)
+    refresh_token, session_id = make_refresh_token(
+        conn, str(user["id"]), body.app,
+        user_agent=request.headers.get("user-agent"), ip=_client_ip(request),
+    )
+    access_token = make_access_token(str(user["id"]), user["email"], session_id)
 
     return {
         "user": user,
@@ -494,7 +535,7 @@ def login(body: LoginBody, conn=Depends(get_conn)):
     }
 
 @app.post("/auth/verify-2fa")
-def verify_2fa(body: Verify2FABody, conn=Depends(get_conn)):
+def verify_2fa(body: Verify2FABody, request: Request, conn=Depends(get_conn)):
     payload = decode_2fa_challenge(body.challenge_token)
     user_id = payload["sub"]
     submitted_hash = _hash_code(body.code.strip())
@@ -521,8 +562,11 @@ def verify_2fa(body: Verify2FABody, conn=Depends(get_conn)):
     if not user:
         raise HTTPException(404, "User not found")
 
-    access_token = make_access_token(str(user["id"]), user["email"])
-    refresh_token = make_refresh_token(conn, str(user["id"]), payload.get("app"))
+    refresh_token, session_id = make_refresh_token(
+        conn, str(user["id"]), payload.get("app"),
+        user_agent=request.headers.get("user-agent"), ip=_client_ip(request),
+    )
+    access_token = make_access_token(str(user["id"]), user["email"], session_id)
 
     return {
         "user": user,
@@ -549,7 +593,7 @@ def toggle_2fa(body: Toggle2FABody, user=Depends(require_user), conn=Depends(get
     return row
 
 @app.post("/auth/refresh")
-def refresh(body: RefreshBody, conn=Depends(get_conn)):
+def refresh(body: RefreshBody, request: Request, conn=Depends(get_conn)):
     token_hash = _hash_refresh_token(body.refresh_token)
 
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -582,8 +626,11 @@ def refresh(body: RefreshBody, conn=Depends(get_conn)):
     if user_row["status"] == "terminated":
         raise HTTPException(403, "This account has been terminated")
 
-    new_access = make_access_token(str(row["user_id"]), user_row["email"])
-    new_refresh = make_refresh_token(conn, str(row["user_id"]), row["app"])
+    new_refresh, new_session_id = make_refresh_token(
+        conn, str(row["user_id"]), row["app"],
+        user_agent=request.headers.get("user-agent"), ip=_client_ip(request),
+    )
+    new_access = make_access_token(str(row["user_id"]), user_row["email"], new_session_id)
 
     return {
         "access_token": new_access,
