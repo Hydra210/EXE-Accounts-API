@@ -5,6 +5,8 @@ import os, secrets, hashlib, json, uuid, urllib.request, urllib.error
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import boto3
+from botocore.config import Config as BotoConfig
 import jwt
 import psycopg2
 import psycopg2.extras
@@ -39,12 +41,16 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 MAIL_FROM = os.environ.get("MAIL_FROM", "EXE Accounts <onboarding@resend.dev>")
 PUBLIC_APP_URL = os.environ.get("PUBLIC_APP_URL", "")  # used to build verify/reset links
 
-# Avatar uploads. NOTE: Render's free/standard web service disks are
-# ephemeral — anything written here gets wiped on every redeploy/restart.
-# Fine for now, but if that bites you later, swap this for an S3-compatible
-# bucket (Cloudflare R2 works well) and keep the same public-URL shape.
-AVATAR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "avatars")
-os.makedirs(AVATAR_DIR, exist_ok=True)
+# Avatar uploads, stored in Cloudflare R2 (S3-compatible) so they survive
+# redeploys — Render's own disk is ephemeral, R2's isn't.
+R2_ACCOUNT_ID        = os.environ["R2_ACCOUNT_ID"]
+R2_ACCESS_KEY_ID     = os.environ["R2_ACCESS_KEY_ID"]
+R2_SECRET_ACCESS_KEY = os.environ["R2_SECRET_ACCESS_KEY"]
+R2_BUCKET_NAME       = os.environ["R2_BUCKET_NAME"]
+# Public bucket URL — either the r2.dev dev subdomain or a custom domain
+# you've mapped to the bucket. No trailing slash.
+R2_PUBLIC_URL        = os.environ["R2_PUBLIC_URL"].rstrip("/")
+
 MAX_AVATAR_BYTES = 5 * 1024 * 1024  # 5MB
 ALLOWED_AVATAR_TYPES = {
     "image/png": "png",
@@ -52,6 +58,15 @@ ALLOWED_AVATAR_TYPES = {
     "image/webp": "webp",
     "image/gif": "gif",
 }
+
+r2 = boto3.client(
+    "s3",
+    endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+    aws_access_key_id=R2_ACCESS_KEY_ID,
+    aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+    config=BotoConfig(signature_version="s3v4"),
+    region_name="auto",
+)
 
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -71,8 +86,7 @@ _icons_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons")
 if os.path.isdir(_icons_dir):
     app.mount("/icons", StaticFiles(directory=_icons_dir), name="icons")
 
-# Serves uploaded avatars at <API_URL>/avatars/...
-app.mount("/avatars", StaticFiles(directory=AVATAR_DIR), name="avatars")
+# Avatars now live in R2, not on local disk — no static mount needed for them.
 
 # Used as the <img src> in emails. Falls back to relative /icons/icon.png if
 # PUBLIC_APP_URL isn't set, which won't load in an inbox — set that env var.
@@ -631,6 +645,12 @@ def update_profile(body: UpdateProfileBody, user=Depends(require_user), conn=Dep
         raise HTTPException(404, "User not found")
     return row
 
+def _r2_key_from_url(url: str) -> Optional[str]:
+    # Only strip a key out of URLs that are actually ours — never touch a
+    # user-supplied external avatar_url from before this feature existed.
+    prefix = f"{R2_PUBLIC_URL}/"
+    return url[len(prefix):] if url.startswith(prefix) else None
+
 @app.post("/auth/me/avatar")
 async def upload_avatar(file: UploadFile = File(...), user=Depends(require_user), conn=Depends(get_conn)):
     ext = ALLOWED_AVATAR_TYPES.get(file.content_type)
@@ -641,18 +661,25 @@ async def upload_avatar(file: UploadFile = File(...), user=Depends(require_user)
     if len(data) > MAX_AVATAR_BYTES:
         raise HTTPException(400, "Avatar must be under 5MB")
 
-    # Look up the old avatar first so we can delete the file after the DB
-    # commit succeeds — never delete before we know the swap actually took.
+    # Look up the old avatar first so we can delete the old R2 object after
+    # the DB commit succeeds — never delete before we know the swap took.
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("SELECT avatar_url FROM exe_users WHERE id = %s", (user["sub"],))
         old = cur.fetchone()
 
-    filename = f"{user['sub']}-{uuid.uuid4().hex[:8]}.{ext}"
-    path = os.path.join(AVATAR_DIR, filename)
-    with open(path, "wb") as f:
-        f.write(data)
+    key = f"avatars/{user['sub']}-{uuid.uuid4().hex[:8]}.{ext}"
+    try:
+        r2.put_object(
+            Bucket=R2_BUCKET_NAME,
+            Key=key,
+            Body=data,
+            ContentType=file.content_type,
+            CacheControl="public, max-age=31536000, immutable",
+        )
+    except Exception:
+        raise HTTPException(502, "Avatar upload to storage failed")
 
-    avatar_url = f"{PUBLIC_APP_URL}/avatars/{filename}" if PUBLIC_APP_URL else f"/avatars/{filename}"
+    avatar_url = f"{R2_PUBLIC_URL}/{key}"
 
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
@@ -664,16 +691,14 @@ async def upload_avatar(file: UploadFile = File(...), user=Depends(require_user)
         row = cur.fetchone()
     conn.commit()
 
-    # Clean up the previous file now that the new one is committed, but only
-    # if it was one of ours (not some external URL a client had set before).
-    if old and old.get("avatar_url") and "/avatars/" in old["avatar_url"]:
-        old_name = old["avatar_url"].rsplit("/avatars/", 1)[-1]
-        old_path = os.path.join(AVATAR_DIR, old_name)
-        if os.path.isfile(old_path) and old_path != path:
-            try:
-                os.remove(old_path)
-            except OSError:
-                pass
+    # Clean up the previous R2 object now that the new one is committed, but
+    # only if it was one of ours (not an external URL a client had set before).
+    old_key = _r2_key_from_url(old["avatar_url"]) if old and old.get("avatar_url") else None
+    if old_key and old_key != key:
+        try:
+            r2.delete_object(Bucket=R2_BUCKET_NAME, Key=old_key)
+        except Exception:
+            pass
 
     if not row:
         raise HTTPException(404, "User not found")
