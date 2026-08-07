@@ -1,7 +1,7 @@
 # EXE ACCOUNT API — Centralized Auth for EXE Development
 # Start command: uvicorn main:app --host 0.0.0.0 --port $PORT
 from __future__ import annotations
-import os, secrets, hashlib, json, urllib.request, urllib.error
+import os, secrets, hashlib, json, uuid, urllib.request, urllib.error
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -11,7 +11,7 @@ import psycopg2.extras
 from psycopg2 import pool as pg_pool
 from fastapi import FastAPI, HTTPException, Depends, Header, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
@@ -26,13 +26,6 @@ ACCESS_TOKEN_MINUTES  = 15
 REFRESH_TOKEN_DAYS    = 30
 TWO_FACTOR_CODE_MINUTES = 10
 
-# Avatar uploads are stored directly in Postgres as bytea — simplest thing
-# that works without standing up separate object storage for a handful of
-# small profile pictures. Revisit if avatars ever need to be much bigger
-# or served at real scale.
-MAX_AVATAR_BYTES = 3 * 1024 * 1024  # 3MB
-ALLOWED_AVATAR_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
-
 # First account registered with this email is auto-promoted to admin.
 # Set this to your own email before you register your first account.
 ADMIN_BOOTSTRAP_EMAIL = os.environ.get("ADMIN_BOOTSTRAP_EMAIL", "").lower().strip()
@@ -45,6 +38,20 @@ ADMIN_BOOTSTRAP_EMAIL = os.environ.get("ADMIN_BOOTSTRAP_EMAIL", "").lower().stri
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 MAIL_FROM = os.environ.get("MAIL_FROM", "EXE Accounts <onboarding@resend.dev>")
 PUBLIC_APP_URL = os.environ.get("PUBLIC_APP_URL", "")  # used to build verify/reset links
+
+# Avatar uploads. NOTE: Render's free/standard web service disks are
+# ephemeral — anything written here gets wiped on every redeploy/restart.
+# Fine for now, but if that bites you later, swap this for an S3-compatible
+# bucket (Cloudflare R2 works well) and keep the same public-URL shape.
+AVATAR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "avatars")
+os.makedirs(AVATAR_DIR, exist_ok=True)
+MAX_AVATAR_BYTES = 5 * 1024 * 1024  # 5MB
+ALLOWED_AVATAR_TYPES = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/webp": "webp",
+    "image/gif": "gif",
+}
 
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -63,6 +70,9 @@ db_pool = pg_pool.SimpleConnectionPool(1, 10, dsn=DATABASE_URL)
 _icons_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons")
 if os.path.isdir(_icons_dir):
     app.mount("/icons", StaticFiles(directory=_icons_dir), name="icons")
+
+# Serves uploaded avatars at <API_URL>/avatars/...
+app.mount("/avatars", StaticFiles(directory=AVATAR_DIR), name="avatars")
 
 # Used as the <img src> in emails. Falls back to relative /icons/icon.png if
 # PUBLIC_APP_URL isn't set, which won't load in an inbox — set that env var.
@@ -83,8 +93,7 @@ def _run_migrations():
     conn = db_pool.getconn()
     try:
         with conn.cursor() as cur:
-            cur.execute("ALTER TABLE exe_users ADD COLUMN IF NOT EXISTS avatar_data BYTEA")
-            cur.execute("ALTER TABLE exe_users ADD COLUMN IF NOT EXISTS avatar_content_type TEXT")
+            cur.execute("ALTER TABLE exe_users ADD COLUMN IF NOT EXISTS avatar_url TEXT")
             cur.execute("ALTER TABLE exe_refresh_tokens ADD COLUMN IF NOT EXISTS user_agent TEXT")
             cur.execute("ALTER TABLE exe_refresh_tokens ADD COLUMN IF NOT EXISTS ip TEXT")
             cur.execute("ALTER TABLE exe_refresh_tokens ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now()")
@@ -129,6 +138,7 @@ class Toggle2FABody(BaseModel):
 
 class UpdateProfileBody(BaseModel):
     display_name: Optional[str] = None
+    avatar_url: Optional[str] = None
 
 class ChangePasswordBody(BaseModel):
     current_password: str
@@ -177,15 +187,6 @@ def _client_ip(request: Request) -> Optional[str]:
     if fwd:
         return fwd.split(",")[0].strip()
     return request.client.host if request.client else None
-
-def _apply_avatar_url(user: dict) -> dict:
-    # Queries select has_avatar (a cheap boolean check) instead of the actual
-    # bytea column, then this turns it into a real URL an <img> tag can just
-    # load directly — avatars are public by design, same as any profile pic,
-    # so this deliberately isn't behind auth.
-    has_avatar = user.pop("has_avatar", False)
-    user["avatar_url"] = f"{PUBLIC_APP_URL}/avatar/{user['id']}" if has_avatar and PUBLIC_APP_URL else None
-    return user
 
 def decode_access_token(token: str) -> dict:
     try:
@@ -502,9 +503,8 @@ def register(body: RegisterBody, conn=Depends(get_conn)):
 def login(body: LoginBody, request: Request, conn=Depends(get_conn)):
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
-            "SELECT id, email, display_name, (avatar_data IS NOT NULL) AS has_avatar, password_hash, "
-            "email_verified, is_admin, status, created_at, two_factor_enabled "
-            "FROM exe_users WHERE email = %s",
+            "SELECT id, email, display_name, avatar_url, password_hash, email_verified, is_admin, "
+            "status, created_at, two_factor_enabled FROM exe_users WHERE email = %s",
             (body.email,),
         )
         user = cur.fetchone()
@@ -538,7 +538,6 @@ def login(body: LoginBody, request: Request, conn=Depends(get_conn)):
         }
 
     del user["password_hash"]
-    user = _apply_avatar_url(user)
     refresh_token, session_id = make_refresh_token(
         conn, str(user["id"]), body.app,
         user_agent=request.headers.get("user-agent"), ip=_client_ip(request),
@@ -570,9 +569,8 @@ def verify_2fa(body: Verify2FABody, request: Request, conn=Depends(get_conn)):
 
         cur.execute("UPDATE exe_login_codes SET consumed_at = now() WHERE id = %s", (row["id"],))
         cur.execute(
-            "SELECT id, email, display_name, (avatar_data IS NOT NULL) AS has_avatar, "
-            "email_verified, is_admin, status, created_at, two_factor_enabled "
-            "FROM exe_users WHERE id = %s",
+            "SELECT id, email, display_name, avatar_url, email_verified, is_admin, status, "
+            "created_at, two_factor_enabled FROM exe_users WHERE id = %s",
             (user_id,),
         )
         user = cur.fetchone()
@@ -580,7 +578,6 @@ def verify_2fa(body: Verify2FABody, request: Request, conn=Depends(get_conn)):
 
     if not user:
         raise HTTPException(404, "User not found")
-    user = _apply_avatar_url(user)
 
     refresh_token, session_id = make_refresh_token(
         conn, str(user["id"]), payload.get("app"),
@@ -614,81 +611,73 @@ def toggle_2fa(body: Toggle2FABody, user=Depends(require_user), conn=Depends(get
 
 @app.patch("/auth/me")
 def update_profile(body: UpdateProfileBody, user=Depends(require_user), conn=Depends(get_conn)):
-    # display_name is optional so an empty PATCH is harmless, but there's
-    # only one field here now — avatar changes go through POST /auth/avatar
-    # instead, since that's a file upload, not a JSON field.
+    # Both fields optional so the settings page can send just whichever one
+    # actually changed. COALESCE keeps the existing value when a field is
+    # omitted (None), rather than wiping it.
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
             "UPDATE exe_users SET "
             "display_name = COALESCE(%s, display_name), "
+            "avatar_url = COALESCE(%s, avatar_url), "
             "updated_at = now() "
             "WHERE id = %s "
-            "RETURNING id, email, display_name, (avatar_data IS NOT NULL) AS has_avatar, "
-            "email_verified, is_admin, status, created_at, two_factor_enabled",
-            (body.display_name, user["sub"]),
+            "RETURNING id, email, display_name, avatar_url, email_verified, is_admin, status, "
+            "created_at, two_factor_enabled",
+            (body.display_name, body.avatar_url, user["sub"]),
         )
         row = cur.fetchone()
     conn.commit()
     if not row:
         raise HTTPException(404, "User not found")
-    return _apply_avatar_url(row)
+    return row
 
-@app.post("/auth/avatar")
+@app.post("/auth/me/avatar")
 async def upload_avatar(file: UploadFile = File(...), user=Depends(require_user), conn=Depends(get_conn)):
-    if file.content_type not in ALLOWED_AVATAR_TYPES:
-        raise HTTPException(400, "Avatar must be a PNG, JPEG, WEBP, or GIF image")
+    ext = ALLOWED_AVATAR_TYPES.get(file.content_type)
+    if not ext:
+        raise HTTPException(400, "Avatar must be png, jpg, webp, or gif")
 
     data = await file.read()
-    if not data:
-        raise HTTPException(400, "Empty file")
     if len(data) > MAX_AVATAR_BYTES:
-        raise HTTPException(400, "Avatar must be under 3MB")
+        raise HTTPException(400, "Avatar must be under 5MB")
 
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE exe_users SET avatar_data = %s, avatar_content_type = %s, updated_at = now() "
-            "WHERE id = %s",
-            (psycopg2.Binary(data), file.content_type, user["sub"]),
-        )
-        updated = cur.rowcount
-    conn.commit()
-    if not updated:
-        raise HTTPException(404, "User not found")
+    # Look up the old avatar first so we can delete the file after the DB
+    # commit succeeds — never delete before we know the swap actually took.
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT avatar_url FROM exe_users WHERE id = %s", (user["sub"],))
+        old = cur.fetchone()
 
-    return {"avatar_url": f"{PUBLIC_APP_URL}/avatar/{user['sub']}" if PUBLIC_APP_URL else None}
+    filename = f"{user['sub']}-{uuid.uuid4().hex[:8]}.{ext}"
+    path = os.path.join(AVATAR_DIR, filename)
+    with open(path, "wb") as f:
+        f.write(data)
 
-@app.delete("/auth/avatar")
-def remove_avatar(user=Depends(require_user), conn=Depends(get_conn)):
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE exe_users SET avatar_data = NULL, avatar_content_type = NULL, updated_at = now() "
-            "WHERE id = %s",
-            (user["sub"],),
-        )
-        updated = cur.rowcount
-    conn.commit()
-    if not updated:
-        raise HTTPException(404, "User not found")
-    return {"ok": True}
+    avatar_url = f"{PUBLIC_APP_URL}/avatars/{filename}" if PUBLIC_APP_URL else f"/avatars/{filename}"
 
-@app.get("/avatar/{user_id}")
-def get_avatar(user_id: str, conn=Depends(get_conn)):
-    # Deliberately public/unauthenticated — an <img src> can't send an
-    # Authorization header, and avatars are meant to be visible to anyone
-    # anyway (same as any profile picture on any site).
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
-            "SELECT avatar_data, avatar_content_type FROM exe_users WHERE id = %s",
-            (user_id,),
+            "UPDATE exe_users SET avatar_url = %s, updated_at = now() WHERE id = %s "
+            "RETURNING id, email, display_name, avatar_url, email_verified, is_admin, status, "
+            "created_at, two_factor_enabled",
+            (avatar_url, user["sub"]),
         )
         row = cur.fetchone()
-    if not row or not row["avatar_data"]:
-        raise HTTPException(404, "No avatar set")
-    return Response(
-        content=bytes(row["avatar_data"]),
-        media_type=row["avatar_content_type"] or "image/png",
-        headers={"Cache-Control": "public, max-age=3600"},
-    )
+    conn.commit()
+
+    # Clean up the previous file now that the new one is committed, but only
+    # if it was one of ours (not some external URL a client had set before).
+    if old and old.get("avatar_url") and "/avatars/" in old["avatar_url"]:
+        old_name = old["avatar_url"].rsplit("/avatars/", 1)[-1]
+        old_path = os.path.join(AVATAR_DIR, old_name)
+        if os.path.isfile(old_path) and old_path != path:
+            try:
+                os.remove(old_path)
+            except OSError:
+                pass
+
+    if not row:
+        raise HTTPException(404, "User not found")
+    return row
 
 @app.post("/auth/change-password")
 def change_password(body: ChangePasswordBody, user=Depends(require_user), conn=Depends(get_conn)):
@@ -867,15 +856,14 @@ def reset_password_page(token: str):
 def me(user=Depends(require_user), conn=Depends(get_conn)):
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
-            "SELECT id, email, display_name, (avatar_data IS NOT NULL) AS has_avatar, "
-            "email_verified, is_admin, status, created_at, two_factor_enabled "
-            "FROM exe_users WHERE id = %s",
+            "SELECT id, email, display_name, avatar_url, email_verified, is_admin, status, "
+            "created_at, two_factor_enabled FROM exe_users WHERE id = %s",
             (user["sub"],),
         )
         row = cur.fetchone()
     if not row:
         raise HTTPException(404, "User not found")
-    return _apply_avatar_url(row)
+    return row
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ROUTES — ADMIN
