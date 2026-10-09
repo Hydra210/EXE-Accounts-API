@@ -801,6 +801,7 @@ def revoke_other_sessions(user=Depends(require_user), conn=Depends(get_conn)):
     return {"ok": True, "revoked": count}
 
 
+@app.post("/auth/refresh")
 def refresh(body: RefreshBody, request: Request, conn=Depends(get_conn)):
     token_hash = _hash_refresh_token(body.refresh_token)
 
